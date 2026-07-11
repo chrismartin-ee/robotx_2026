@@ -1,0 +1,37 @@
+{
+    "model": {
+        "xml": "epoch60.xml",
+        "bin": "epoch60.bin"
+    },
+    "nn_config": {
+        "output_format": "detection",
+        "NN_family": "YOLO",
+        "input_size": "640x352",
+        "NN_specific_metadata": {
+            "classes": 13,
+            "coordinates": 4,
+            "anchors": [],
+            "anchor_masks": {},
+            "iou_threshold": 0.5,
+            "confidence_threshold": 0.5
+        }
+    },
+    "mappings": {
+        "labels": [
+            "black_buoy",
+            "black_cross",
+            "black_target_boat",
+            "black_triangle",
+            "blue_buoy",
+            "green_buoy",
+            "green_light_buoy",
+            "green_pole_buoy",
+            "red_buoy",
+            "red_light_buoy",
+            "red_pole_buoy",
+            "yellow_buoy",
+            "yellow_target_boat"
+        ]
+    },
+    "version": 1
+}

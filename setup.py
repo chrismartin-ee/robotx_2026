@@ -23,6 +23,7 @@ setup(
         'console_scripts': [
             'led_node = robotx_2026.api.led.led_node:main',
             'pixhawk_led_node = robotx_2026.api.pixhawk.pixhawk_led_status_node:main',
+            'gate_navigator = robotx_2026.api.navigation.gate_navigator:main',
         ],
     },
 )

@@ -69,7 +69,7 @@ class PixhawkLEDStatusNode(Node):
 
         if not self.armed or self.estop_active:
             self.publish_led_state(1)
-        elif self.mode == "AUTO":
+        elif self.mode in ("AUTO", "GUIDED"):
             self.publish_led_state(3)
         else:
             self.publish_led_state(2)

@@ -20,11 +20,14 @@ GREEN_CLASSES = {"green_buoy", "green_pole_buoy", "green_light_buoy"}
 
 CONF_MIN = 0.60          # min confidence to use a buoy for correction
 RANGE_MAX = 25.0         # m - ignore detections beyond this
-PAIR_FRESH_S = 2.0       # red+green must both be seen within this window
+PAIR_FRESH_S = 1.5       # red+green must both be seen within this window
 MAX_CORRECTION = 15.0    # m - corrected point must be this close to planned
-ARRIVE_RADIUS = 2.5      # m
+ARRIVE_RADIUS = 0.75      # m
 CMD_PERIOD = 1.0         # s between guided target sends
 M_PER_DEG = 111111.0
+GATE_MIN_WIDTH = 1.0    # m - red/green closer than this = same buoy misread
+GATE_MAX_WIDTH = 8.0    # m - farther apart than this = not a gate
+
 
 
 def offset_latlon(lat, lon, north_m, east_m):
@@ -157,12 +160,6 @@ class GateNavigator(Node):
         if self.done or self.lat is None or self.heading is None:
             return
 
-        if not self.guided_set:
-            self.mav.set_mode('GUIDED')
-            self.guided_set = True
-            self.get_logger().info("Mode -> GUIDED, starting mission")
-            return
-
         if self.mode not in ("GUIDED",):
             return  # pilot took over; hold fire until back in GUIDED
 
@@ -206,19 +203,23 @@ class GateNavigator(Node):
         dets = self.q_nn.tryGet()
         if dets is not None:
             self.last_dets = dets.detections
-            now = time.time()
-            for d in dets.detections:
-                name = LABELS[d.label]
-                z = d.spatialCoordinates.z / 1000.0
-                x = d.spatialCoordinates.x / 1000.0
-                if d.confidence < CONF_MIN or z <= 0.3 or z > RANGE_MAX:
-                    continue
-                if name in RED_CLASSES:
-                    if self.last_red is None or z < self.last_red[1]:
-                        self.last_red = (now, z, x)
-                elif name in GREEN_CLASSES:
-                    if self.last_green is None or z < self.last_green[1]:
-                        self.last_green = (now, z, x)
+            if self.lat is not None and self.heading is not None:
+                now = time.time()
+                best = {"red": None, "green": None}   # nearest valid per color, this frame
+                for d in dets.detections:
+                    name = LABELS[d.label]
+                    z = d.spatialCoordinates.z / 1000.0
+                    x = d.spatialCoordinates.x / 1000.0
+                    if d.confidence < CONF_MIN or z <= 0.3 or z > RANGE_MAX:
+                        continue
+                    col = ("red" if name in RED_CLASSES else
+                           "green" if name in GREEN_CLASSES else None)
+                    if col and (best[col] is None or z < best[col][0]):
+                        best[col] = (z, x)
+                if best["red"]:
+                    self.last_red = (now, self._body_to_world(*best["red"]))
+                if best["green"]:
+                    self.last_green = (now, self._body_to_world(*best["green"]))
         f = self.q_rgb.tryGet()
         if f is not None:
             frame = f.getCvFrame()
@@ -226,25 +227,36 @@ class GateNavigator(Node):
             with self.frame_lock:
                 self.frame = frame
 
+    def _body_to_world(self, z, x):
+        th = math.radians(self.heading)
+        north = z * math.cos(th) - x * math.sin(th)
+        east = z * math.sin(th) + x * math.cos(th)
+        return offset_latlon(self.lat, self.lon, north, east)
+
     def _update_correction(self):
         now = time.time()
         if (self.last_red is None or self.last_green is None or
                 now - self.last_red[0] > PAIR_FRESH_S or
                 now - self.last_green[0] > PAIR_FRESH_S):
             return
-        _, zr, xr = self.last_red
-        _, zg, xg = self.last_green
-        z_mid, x_mid = (zr + zg) / 2.0, (xr + xg) / 2.0
-        th = math.radians(self.heading)
-        north = z_mid * math.cos(th) - x_mid * math.sin(th)
-        east = z_mid * math.sin(th) + x_mid * math.cos(th)
-        cand = offset_latlon(self.lat, self.lon, north, east)
-        if dist_m(*cand, *self.waypoints[self.wp_index]) <= MAX_CORRECTION:
-            if self.correction is None:
-                self.correction = cand
-            else:  # smooth: blend new estimate with old
-                self.correction = ((self.correction[0] + cand[0]) / 2,
-                                   (self.correction[1] + cand[1]) / 2)
+        rlat, rlon = self.last_red[1]
+        glat, glon = self.last_green[1]
+        sep = dist_m(rlat, rlon, glat, glon)
+        if sep < GATE_MIN_WIDTH or sep > GATE_MAX_WIDTH:
+            return
+        cand = ((rlat + glat) / 2, (rlon + glon) / 2)
+        if dist_m(*cand, *self.waypoints[self.wp_index]) > MAX_CORRECTION:
+            return
+        if self.correction is None:
+            self.correction = cand
+        else:
+            self.correction = ((self.correction[0] + cand[0]) / 2,
+                               (self.correction[1] + cand[1]) / 2)
+        self.get_logger().info(
+            f"red@({self.last_red[1][0]:.7f},{self.last_red[1][1]:.7f}) "
+            f"green@({self.last_green[1][0]:.7f},{self.last_green[1][1]:.7f}) "
+            f"sep {sep:.1f}m mid->({cand[0]:.7f},{cand[1]:.7f})",
+            throttle_duration_sec=1.0)
 
     def _send_target(self, lat, lon):
         self.mav.mav.set_position_target_global_int_send(

@@ -10,7 +10,7 @@ import rclpy
 from rclpy.node import Node
 from pymavlink import mavutil
 
-BLOB = str((Path(__file__).parent / "../../../models/buoy_v16.blob").resolve())
+BLOB = "/root/robotx_ws/src/robotx_2026/models/buoy_v16.blob"
 LABELS = ["black_buoy", "black_cross", "black_target_boat", "black_triangle",
           "blue_buoy", "green_buoy", "green_light_buoy", "green_pole_buoy",
           "red_buoy", "red_light_buoy", "red_pole_buoy", "yellow_buoy",

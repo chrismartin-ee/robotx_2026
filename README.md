@@ -47,7 +47,11 @@ robotx_2026/
         │   └── pixhawk_led_status_node.py <- Pixhawk state -> /led_state
         │                                     (1=red 2=yellow 3=green)
         └── navigation/
+            └── dp_hold.py		<- holds position in relation to target (buoy for now, hard 
+                                           coded yaw and distance from target, keeping target centered 
+                                           with lateral movement)
             └── gate_navigator.py          <- GUIDED-mode gate navigation:
                                               drives QGC waypoints, corrects
                                               to buoy-gate midpoints (UNTESTED)
+
 ```

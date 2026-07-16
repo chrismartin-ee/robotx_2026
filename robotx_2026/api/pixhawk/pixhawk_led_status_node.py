@@ -1,7 +1,7 @@
+import time
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32
-
+from std_msgs.msg import Int32, Bool
 from pymavlink import mavutil
 
 
@@ -19,7 +19,8 @@ class PixhawkLEDStatusNode(Node):
         self.estop_channel = self.get_parameter('estop_channel').value
 
         self.led_pub = self.create_publisher(Int32, "/led_state", 10)
-
+        self.autonomy_t = 0.0
+        self.create_subscription(Bool, '/autonomy_active', self._auto_cb, 10)
         self.last_led_state = None
         self.estop_active = True   # assume killed until real data arrives
         self.armed = False
@@ -38,6 +39,10 @@ class PixhawkLEDStatusNode(Node):
             0, 0, 0, 0, 0)
 
         self.timer = self.create_timer(0.2, self.check_pixhawk_state)
+
+    def _auto_cb(self, msg):
+        if msg.data:
+            self.autonomy_t = time.time()
 
     def publish_led_state(self, state):
         if state == self.last_led_state:
@@ -69,7 +74,7 @@ class PixhawkLEDStatusNode(Node):
 
         if not self.armed or self.estop_active:
             self.publish_led_state(1)
-        elif self.mode in ("AUTO", "GUIDED"):
+        elif self.mode in ("AUTO", "GUIDED") or (time.time() - self.autonomy_t) < 1.0:
             self.publish_led_state(3)
         else:
             self.publish_led_state(2)

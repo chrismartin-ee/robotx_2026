@@ -1,44 +1,106 @@
+#!/usr/bin/env python3
+
 import math
 import time
 import threading
+from collections import deque
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from statistics import median
 
-import numpy as np
 import cv2
 import depthai as dai
+import numpy as np
 import rclpy
-from rclpy.node import Node
 from pymavlink import mavutil
+from rclpy.node import Node
 from ultralytics import YOLO
 
+
 ENGINE = "/root/robotx_ws/src/robotx_2026/models/buoy_v16.engine"
-LABELS = ["black_buoy", "black_cross", "black_target_boat", "black_triangle",
-          "blue_buoy", "green_buoy", "green_light_buoy", "green_pole_buoy",
-          "red_buoy", "red_light_buoy", "red_pole_buoy", "yellow_buoy",
-          "yellow_target_boat"]
+
+LABELS = [
+    "black_buoy",
+    "black_cross",
+    "black_target_boat",
+    "black_triangle",
+    "blue_buoy",
+    "green_buoy",
+    "green_light_buoy",
+    "green_pole_buoy",
+    "red_buoy",
+    "red_light_buoy",
+    "red_pole_buoy",
+    "yellow_buoy",
+    "yellow_target_boat",
+]
+
 RED_CLASSES = {"red_buoy", "red_pole_buoy", "red_light_buoy"}
 GREEN_CLASSES = {"green_buoy", "green_pole_buoy", "green_light_buoy"}
 
-CONF_MIN = 0.60          # min confidence for a buoy to drive corrections
-CONF_SHOW = 0.40         # min confidence to display on the stream
-RANGE_MAX = 25.0         # m
-PAIR_FRESH_S = 1.5       # red+green must both be seen within this window
-GATE_MIN_WIDTH = 1.0     # m - closer = same buoy misread as two colors
-GATE_MAX_WIDTH = 8.0     # m - farther = not a gate
-MAX_CORRECTION = 15.0    # m - corrected point must be near planned waypoint
-ARRIVE_RADIUS = 1.0      # m - pool scale; enlarge for the lake
-CMD_PERIOD = 1.0         # s between guided target sends
+# ---------------- Detection and gate settings ----------------
+CONF_MIN = 0.60
+CONF_SHOW = 0.40
+RANGE_MIN = 0.30
+RANGE_MAX = 25.0
+
+GATE_WP_INDICES = {0, 1}    # zero-based waypoints treated as gates (wp1, wp2)
+GATE_MIN_WIDTH = 1.0        # meters
+GATE_MAX_WIDTH = 8.0        # meters
+PAIR_MAX_DEPTH_DIFF = 5.0   # meters; rejects unlikely red/green pairings
+PAIR_MIN_PIXEL_SEP = 12     # pixels; rejects duplicate boxes on one buoy
+MAX_CORRECTION = 15.0       # midpoint must be this close to planned waypoint
+MIDPOINT_SHIFT_RATIO = 0.5   # shift target toward the RIGHT-side buoy by this fraction of the gap
+
+PAIR_CONFIRM_FRAMES = 6
+PAIR_SAMPLE_TIMEOUT = 0.60  # clear samples if detections stop being consecutive
+PAIR_MAX_SPREAD = 1.00      # maximum world-position spread before locking
+
+# The boat first drives to the gate midpoint, then to a point beyond the gate.
+# This prevents it from turning toward waypoint 2 while still between the buoys.
+GATE_EXIT_DISTANCE = 0.2
+MIDPOINT_SWITCH_RADIUS = 1.0
+EXIT_ARRIVE_RADIUS = 1.0
+NORMAL_WP_ARRIVE_RADIUS = 1.0
+
+# Positive yaw offset rotates camera measurements clockwise/right relative to
+# the Pixhawk heading. Leave at 0 if the OAK-D points exactly straight ahead.
+CAMERA_YAW_OFFSET_DEG = 0.0
+
+# Optional camera position relative to the GPS/Pixhawk reference point.
+# Positive forward is toward the bow; positive right is starboard.
+CAMERA_FORWARD_OFFSET_M = 0.0
+CAMERA_RIGHT_OFFSET_M = 0.0
+
+CMD_PERIOD = 1.0
 M_PER_DEG = 111111.0
+
+# ArduPilot's documented position-only SET_POSITION_TARGET_GLOBAL_INT mask.
+POSITION_ONLY_TYPE_MASK = 0b110111111100  # 3580
+
+# Camera/depth output dimensions. 1920x1200 RGB scaled by 1/3 is 640x400,
+# matching the OAK-D 400p stereo stream without aspect-ratio cropping.
+CAM_WIDTH = 640
+CAM_HEIGHT = 400
+CAM_FPS = 30
+SYNC_THRESHOLD_MS = 50
 
 
 def offset_latlon(lat, lon, north_m, east_m):
-    return (lat + north_m / M_PER_DEG,
-            lon + east_m / (M_PER_DEG * math.cos(math.radians(lat))))
+    cos_lat = max(abs(math.cos(math.radians(lat))), 1e-6)
+    return (
+        lat + north_m / M_PER_DEG,
+        lon + east_m / (M_PER_DEG * cos_lat),
+    )
 
 
 def dist_m(lat1, lon1, lat2, lon2):
     dn = (lat2 - lat1) * M_PER_DEG
-    de = (lon2 - lon1) * M_PER_DEG * math.cos(math.radians(lat1))
+    de = (
+        (lon2 - lon1)
+        * M_PER_DEG
+        * math.cos(math.radians((lat1 + lat2) / 2.0))
+    )
     return math.hypot(dn, de)
 
 
@@ -46,8 +108,8 @@ class GateNavigator(Node):
     def __init__(self):
         super().__init__("gate_navigator")
 
-        self.declare_parameter('endpoint', 'udpin:127.0.0.1:14551')
-        endpoint = self.get_parameter('endpoint').value
+        self.declare_parameter("endpoint", "udpin:127.0.0.1:14551")
+        endpoint = self.get_parameter("endpoint").value
 
         self.get_logger().info(f"Connecting MAVLink on {endpoint}")
         self.mav = mavutil.mavlink_connection(endpoint)
@@ -56,8 +118,24 @@ class GateNavigator(Node):
 
         self.waypoints = self._fetch_mission()
         if not self.waypoints:
-            raise RuntimeError("No waypoints on vehicle - upload a mission in QGC first")
-        self.get_logger().info(f"Fetched {len(self.waypoints)} waypoints from vehicle")
+            raise RuntimeError(
+                "No NAV_WAYPOINT items found on vehicle. Upload a mission in QGC first."
+            )
+
+        self.get_logger().info(
+            f"Fetched {len(self.waypoints)} navigation waypoints from vehicle"
+        )
+        for index, waypoint in enumerate(self.waypoints, start=1):
+            self.get_logger().info(
+                f"WP {index}: {waypoint[0]:.7f}, {waypoint[1]:.7f}"
+            )
+
+        if max(GATE_WP_INDICES) >= len(self.waypoints):
+            raise RuntimeError(
+                f"GATE_WP_INDICES={GATE_WP_INDICES} but only "
+                f"{len(self.waypoints)} waypoint(s) were fetched"
+            )
+
         self.wp_index = 0
 
         self.lat = None
@@ -66,312 +144,836 @@ class GateNavigator(Node):
         self.mode = ""
         self.armed = False
 
-        self.last_red = None      # (t, (lat, lon))
-        self.last_green = None
-        self.correction = None
+        # Gate state
+        self.gate_samples = deque(maxlen=PAIR_CONFIRM_FRAMES)
+        self.last_pair_sample_time = 0.0
+        self.gate_midpoint = None
+        self.gate_exit = None
+        self.gate_locked = False
+        self.gate_clearing = False
+
+        # Camera/debug state
         self.frame = None
         self.frame_lock = threading.Lock()
-
         self.depth_img = None
         self.fx = None
         self.cx = None
+        self.last_gate_debug = None
 
         self.get_logger().info("Loading TensorRT engine...")
         self.model = YOLO(ENGINE, task="detect")
         self._start_camera()
         self._start_stream()
-        self.get_logger().info("Camera + GPU model up")
+        self.get_logger().info("Camera, synchronized depth, and GPU model ready")
 
         self.last_cmd = 0.0
+        self.last_waiting_log = 0.0
         self.done = False
         self.fps = 0.0
         self._t_prev = time.time()
+
         self.timer = self.create_timer(0.05, self.tick)
 
-    # ---------- mission fetch ----------
+    # ---------------- Mission fetch ----------------
     def _fetch_mission(self):
         self.mav.mav.mission_request_list_send(
-            self.mav.target_system, self.mav.target_component)
-        msg = self.mav.recv_match(type='MISSION_COUNT', blocking=True, timeout=5)
-        if msg is None:
-            return []
-        wps = []
-        for i in range(msg.count):
-            self.mav.mav.mission_request_int_send(
-                self.mav.target_system, self.mav.target_component, i)
-            item = self.mav.recv_match(type='MISSION_ITEM_INT',
-                                       blocking=True, timeout=5)
-            if item and item.command == 16 and item.seq > 0:
-                wps.append((item.x / 1e7, item.y / 1e7))
-        self.mav.mav.mission_ack_send(self.mav.target_system,
-                                      self.mav.target_component, 0)
-        return wps
+            self.mav.target_system,
+            self.mav.target_component,
+        )
 
-    # ---------- camera: RGB + depth only, inference on GPU ----------
+        count_msg = self.mav.recv_match(
+            type="MISSION_COUNT",
+            blocking=True,
+            timeout=5,
+        )
+        if count_msg is None:
+            return []
+
+        waypoints = []
+
+        for sequence in range(count_msg.count):
+            self.mav.mav.mission_request_int_send(
+                self.mav.target_system,
+                self.mav.target_component,
+                sequence,
+            )
+
+            item = self.mav.recv_match(
+                type=["MISSION_ITEM_INT", "MISSION_ITEM"],
+                blocking=True,
+                timeout=5,
+            )
+            if item is None:
+                self.get_logger().warning(
+                    f"Timed out while requesting mission item {sequence}"
+                )
+                continue
+
+            # ArduPilot mission downloads commonly expose home as sequence 0.
+            # Keep the original behavior of ignoring that entry.
+            if item.command != mavutil.mavlink.MAV_CMD_NAV_WAYPOINT or item.seq <= 0:
+                continue
+
+            if item.get_type() == "MISSION_ITEM_INT":
+                lat = item.x / 1e7
+                lon = item.y / 1e7
+            else:
+                lat = float(item.x)
+                lon = float(item.y)
+
+            waypoints.append((lat, lon))
+
+        self.mav.mav.mission_ack_send(
+            self.mav.target_system,
+            self.mav.target_component,
+            mavutil.mavlink.MAV_MISSION_ACCEPTED,
+        )
+
+        return waypoints
+
+    # ---------------- OAK-D RGB + aligned synchronized depth ----------------
     def _start_camera(self):
-        p = dai.Pipeline()
-        cam = p.create(dai.node.ColorCamera)
-        cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1200_P)
-        cam.setIspScale(2, 3)
-        cam.setPreviewSize(640, 352)
-        cam.setInterleaved(False)
-        cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-        cam.setFps(30)
-        left = p.create(dai.node.ColorCamera)
+        pipeline = dai.Pipeline()
+
+        rgb = pipeline.create(dai.node.ColorCamera)
+        rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+        rgb.setResolution(
+            dai.ColorCameraProperties.SensorResolution.THE_1200_P
+        )
+        rgb.setIspScale(1, 3)  # 1920x1200 -> 640x400
+        rgb.setInterleaved(False)
+        rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+        rgb.setFps(CAM_FPS)
+
+        left = pipeline.create(dai.node.ColorCamera)
         left.setCamera("left")
-        left.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1200_P)
+        left.setResolution(
+            dai.ColorCameraProperties.SensorResolution.THE_1200_P
+        )
         left.setIspScale(1, 3)
-        left.setFps(30)
-        right = p.create(dai.node.ColorCamera)
+        left.setFps(CAM_FPS)
+
+        right = pipeline.create(dai.node.ColorCamera)
         right.setCamera("right")
-        right.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1200_P)
+        right.setResolution(
+            dai.ColorCameraProperties.SensorResolution.THE_1200_P
+        )
         right.setIspScale(1, 3)
-        right.setFps(30)
-        stereo = p.create(dai.node.StereoDepth)
-        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
+        right.setFps(CAM_FPS)
+
+        stereo = pipeline.create(dai.node.StereoDepth)
+        stereo.setDefaultProfilePreset(
+            dai.node.StereoDepth.PresetMode.DEFAULT
+        )
         stereo.setLeftRightCheck(True)
-        stereo.setSubpixel(False)
+        stereo.setSubpixel(True)
         stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
+        stereo.setOutputSize(CAM_WIDTH, CAM_HEIGHT)
+
         left.isp.link(stereo.left)
         right.isp.link(stereo.right)
-        xo_rgb = p.create(dai.node.XLinkOut)
-        xo_rgb.setStreamName("rgb")
-        cam.preview.link(xo_rgb.input)
-        xo_d = p.create(dai.node.XLinkOut)
-        xo_d.setStreamName("depth")
-        stereo.depth.link(xo_d.input)
-        self.device = dai.Device(p)
-        self.q_rgb = self.device.getOutputQueue("rgb", maxSize=4, blocking=False)
-        self.q_depth = self.device.getOutputQueue("depth", maxSize=4, blocking=False)
 
-    def _depth_at(self, u, v, half=8):
-        """Median depth (m) around preview pixel (u,v); returns (z, du, dv)."""
-        dh, dw = self.depth_img.shape[:2]
-        s = dw / 640.0
-        crop_off = (dh / s - 352.0) / 2.0
-        du, dv = int(u * s), int((v + crop_off) * s)
-        u0, u1 = max(0, du - half), min(dw, du + half + 1)
-        v0, v1 = max(0, dv - half), min(dh, dv + half + 1)
+        sync = pipeline.create(dai.node.Sync)
+        sync.setSyncThreshold(timedelta(milliseconds=SYNC_THRESHOLD_MS))
+
+        rgb.isp.link(sync.inputs["rgb"])
+        stereo.depth.link(sync.inputs["depth"])
+
+        xout = pipeline.create(dai.node.XLinkOut)
+        xout.setStreamName("rgbd")
+        sync.out.link(xout.input)
+
+        self.device = dai.Device(pipeline)
+        self.q_rgbd = self.device.getOutputQueue(
+            "rgbd",
+            maxSize=4,
+            blocking=False,
+        )
+
+    def _depth_for_box(self, box):
+        """Return depth and lateral position for one RGB bounding box.
+
+        The depth frame is aligned and synchronized to the 640x400 RGB frame,
+        so RGB pixel coordinates can be used directly on the depth image.
+        """
+        if self.depth_img is None or self.fx is None or self.cx is None:
+            return None, None, None, None
+
+        x1, y1, x2, y2 = box
+        height, width = self.depth_img.shape[:2]
+
+        x1 = max(0, min(width - 1, x1))
+        x2 = max(0, min(width - 1, x2))
+        y1 = max(0, min(height - 1, y1))
+        y2 = max(0, min(height - 1, y2))
+
+        if x2 <= x1 or y2 <= y1:
+            return None, None, None, None
+
+        # Use a narrow central strip so the median is more likely to land on
+        # the buoy rather than the water/background inside the full box.
+        u = int((x1 + x2) / 2)
+        v = int(y1 + 0.55 * (y2 - y1))
+
+        half_w = max(4, min(12, (x2 - x1) // 8))
+        half_h = max(5, min(20, (y2 - y1) // 6))
+
+        u0 = max(0, u - half_w)
+        u1 = min(width, u + half_w + 1)
+        v0 = max(0, v - half_h)
+        v1 = min(height, v + half_h + 1)
+
         roi = self.depth_img[v0:v1, u0:u1].astype(np.float32)
-        valid = roi[roi > 0]
-        if valid.size == 0:
-            return None, du, dv
-        return float(np.median(valid)) / 1000.0, du, dv
+        valid = roi[
+            (roi >= RANGE_MIN * 1000.0)
+            & (roi <= RANGE_MAX * 1000.0)
+        ]
 
-    # ---------- main loop ----------
+        if valid.size < 5:
+            return None, None, u, v
+
+        forward_m = float(np.median(valid)) / 1000.0
+        right_m = (u - self.cx) * forward_m / self.fx
+
+        return forward_m, right_m, u, v
+
+    # ---------------- Main control loop ----------------
     def tick(self):
         self._drain_mavlink()
         self._drain_camera()
-        if self.done or self.lat is None or self.heading is None:
-            return
-        if self.mode not in ("GUIDED",):
+
+        if self.done or self.lat is None or self.lon is None or self.heading is None:
             return
 
-        self._update_correction()
-
-        planned = self.waypoints[self.wp_index]
-        target = self.correction if self.correction else planned
-
-        if dist_m(self.lat, self.lon, *target) < ARRIVE_RADIUS:
-            self.get_logger().info(f"Waypoint {self.wp_index + 1} reached")
-            self.wp_index += 1
-            self.correction = None
-            self.last_red = self.last_green = None
-            if self.wp_index >= len(self.waypoints):
-                self.get_logger().info("Mission complete - LOITER")
-                self.mav.set_mode('LOITER')
-                self.done = True
+        if self.mode != "GUIDED":
             return
+
+        if self.wp_index >= len(self.waypoints):
+            self._finish_mission()
+            return
+
+        target = self._current_target()
+        if target is None:
+            return
+
+        distance = dist_m(self.lat, self.lon, *target)
+
+        if self.wp_index in GATE_WP_INDICES:
+            if self.gate_locked:
+                if not self.gate_clearing and distance < MIDPOINT_SWITCH_RADIUS:
+                    self.gate_clearing = True
+                    self.get_logger().info(
+                        "Gate midpoint reached; commanding the gate-exit point"
+                    )
+                    target = self.gate_exit
+                    distance = dist_m(self.lat, self.lon, *target)
+
+                elif self.gate_clearing and distance < EXIT_ARRIVE_RADIUS:
+                    self.get_logger().info(
+                        f"Gate cleared at waypoint {self.wp_index + 1}"
+                    )
+                    self._advance_waypoint()
+                    return
+            else:
+                planned = self.waypoints[self.wp_index]
+                planned_distance = dist_m(self.lat, self.lon, *planned)
+
+                # Do not skip the gate merely because the approximate QGC
+                # waypoint was reached. Hold there until a stable gate is found.
+                if planned_distance < NORMAL_WP_ARRIVE_RADIUS:
+                    now = time.time()
+                    if now - self.last_waiting_log > 2.0:
+                        self.get_logger().info(
+                            "At planned gate waypoint; waiting for a stable "
+                            "same-frame red/green detection"
+                        )
+                        self.last_waiting_log = now
+        else:
+            if distance < NORMAL_WP_ARRIVE_RADIUS:
+                self.get_logger().info(
+                    f"Waypoint {self.wp_index + 1} reached"
+                )
+                self._advance_waypoint()
+                return
 
         now = time.time()
-        if now - self.last_cmd > CMD_PERIOD:
+        if now - self.last_cmd >= CMD_PERIOD:
             self._send_target(*target)
             self.last_cmd = now
 
+    def _current_target(self):
+        if self.wp_index in GATE_WP_INDICES and self.gate_locked:
+            if self.gate_clearing:
+                return self.gate_exit
+            return self.gate_midpoint
+
+        return self.waypoints[self.wp_index]
+
+    def _advance_waypoint(self):
+        self.wp_index += 1
+        self._reset_gate_state()
+
+        if self.wp_index >= len(self.waypoints):
+            self._finish_mission()
+
+    def _finish_mission(self):
+        if self.done:
+            return
+
+        self.get_logger().info("Mission complete - switching to LOITER")
+        self.mav.set_mode("LOITER")
+        self.done = True
+
+    def _reset_gate_state(self):
+        self.gate_samples.clear()
+        self.last_pair_sample_time = 0.0
+        self.gate_midpoint = None
+        self.gate_exit = None
+        self.gate_locked = False
+        self.gate_clearing = False
+        self.last_gate_debug = None
+
+    # ---------------- MAVLink input ----------------
     def _drain_mavlink(self):
         while True:
-            m = self.mav.recv_match(blocking=False)
-            if m is None:
+            message = self.mav.recv_match(blocking=False)
+            if message is None:
                 break
-            t = m.get_type()
-            if t == "GLOBAL_POSITION_INT":
-                self.lat = m.lat / 1e7
-                self.lon = m.lon / 1e7
-                self.heading = m.hdg / 100.0
-            elif t == "HEARTBEAT" and m.get_srcSystem() == self.mav.target_system:
-                self.armed = bool(m.base_mode &
-                                  mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-                self.mode = mavutil.mode_string_v10(m)
 
+            message_type = message.get_type()
+
+            if message_type == "GLOBAL_POSITION_INT":
+                self.lat = message.lat / 1e7
+                self.lon = message.lon / 1e7
+
+                # 65535 means heading is unknown.
+                if message.hdg != 65535:
+                    self.heading = message.hdg / 100.0
+
+            elif message_type == "VFR_HUD" and self.heading is None:
+                self.heading = float(message.heading)
+
+            elif (
+                message_type == "HEARTBEAT"
+                and message.get_srcSystem() == self.mav.target_system
+            ):
+                self.armed = bool(
+                    message.base_mode
+                    & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                )
+                self.mode = mavutil.mode_string_v10(message)
+
+    # ---------------- Camera inference and gate pairing ----------------
     def _drain_camera(self):
-        d = self.q_depth.tryGet()
-        if d is not None:
-            self.depth_img = d.getFrame()
-            if self.fx is None:
-                calib = self.device.readCalibration()
-                M = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A,
-                                              self.depth_img.shape[1],
-                                              self.depth_img.shape[0])
-                self.fx, self.cx = M[0][0], M[0][2]
+        group = None
 
-        frame = None
+        # Keep the newest complete synchronized RGB/depth group.
         while True:
-            f = self.q_rgb.tryGet()
-            if f is None:
+            candidate_group = self.q_rgbd.tryGet()
+            if candidate_group is None:
                 break
-            frame = f
-        if frame is None:
+            group = candidate_group
+
+        if group is None:
             return
-        img = frame.getCvFrame()
 
-        dets = []
-        res = self.model.predict(img, verbose=False, imgsz=(352, 640),
-                                 conf=CONF_SHOW)[0]
-        if self.depth_img is not None and self.fx is not None:
-            for b in res.boxes:
-                x1, y1, x2, y2 = (int(v) for v in b.xyxy[0])
-                name = LABELS[int(b.cls[0])]
-                conf = float(b.conf[0])
-                z, du, dv = self._depth_at((x1 + x2) // 2, (y1 + y2) // 2)
-                x_m = None
-                if z is not None:
-                    x_m = (du - self.cx) * z / self.fx
-                dets.append({"box": (x1, y1, x2, y2), "name": name,
-                             "conf": conf, "z": z, "x": x_m})
+        messages = {name: message for name, message in group}
+        rgb_message = messages.get("rgb")
+        depth_message = messages.get("depth")
 
-        # nearest confident red + green in THIS frame -> world anchors
-        if self.lat is not None and self.heading is not None:
-            now = time.time()
-            best = {"red": None, "green": None}
-            for det in dets:
-                if (det["conf"] < CONF_MIN or det["z"] is None or
-                        det["x"] is None or det["z"] <= 0.3 or
-                        det["z"] > RANGE_MAX):
-                    continue
-                col = ("red" if det["name"] in RED_CLASSES else
-                       "green" if det["name"] in GREEN_CLASSES else None)
-                if col and (best[col] is None or det["z"] < best[col]["z"]):
-                    best[col] = det
-            if best["red"]:
-                self.last_red = (now, self._body_to_world(best["red"]["z"],
-                                                          best["red"]["x"]))
-            if best["green"]:
-                self.last_green = (now, self._body_to_world(best["green"]["z"],
-                                                            best["green"]["x"]))
+        if rgb_message is None or depth_message is None:
+            return
 
-        self._annotate(img, dets)
+        image = rgb_message.getCvFrame()
+        self.depth_img = depth_message.getFrame()
+
+        if image.shape[:2] != self.depth_img.shape[:2]:
+            self.get_logger().error(
+                "RGB/depth dimensions do not match: "
+                f"RGB={image.shape[:2]}, depth={self.depth_img.shape[:2]}"
+            )
+            return
+
+        if self.fx is None:
+            height, width = self.depth_img.shape[:2]
+            calibration = self.device.readCalibration()
+            intrinsics = calibration.getCameraIntrinsics(
+                dai.CameraBoardSocket.CAM_A,
+                width,
+                height,
+            )
+            self.fx = float(intrinsics[0][0])
+            self.cx = float(intrinsics[0][2])
+            self.get_logger().info(
+                f"RGB intrinsics loaded: fx={self.fx:.2f}, cx={self.cx:.2f}"
+            )
+
+        detections = []
+        result = self.model.predict(
+            image,
+            verbose=False,
+            imgsz=(352, 640),
+            conf=CONF_SHOW,
+        )[0]
+
+        for box in result.boxes:
+            x1, y1, x2, y2 = (int(value) for value in box.xyxy[0])
+            class_index = int(box.cls[0])
+            confidence = float(box.conf[0])
+
+            if class_index < 0 or class_index >= len(LABELS):
+                continue
+
+            name = LABELS[class_index]
+            forward_m, right_m, u, v = self._depth_for_box(
+                (x1, y1, x2, y2)
+            )
+
+            detections.append(
+                {
+                    "box": (x1, y1, x2, y2),
+                    "name": name,
+                    "conf": confidence,
+                    "z": forward_m,
+                    "x": right_m,
+                    "u": u,
+                    "v": v,
+                }
+            )
+
+        gate_debug = None
+
+        if (
+            self.wp_index in GATE_WP_INDICES
+            and not self.gate_locked
+            and self.lat is not None
+            and self.lon is not None
+            and self.heading is not None
+        ):
+            gate_candidate = self._select_gate_candidate(detections)
+
+            if gate_candidate is not None:
+                gate_debug = gate_candidate
+                self._record_gate_candidate(gate_candidate)
+            elif (
+                self.gate_samples
+                and time.time() - self.last_pair_sample_time
+                > PAIR_SAMPLE_TIMEOUT
+            ):
+                self.gate_samples.clear()
+
+        self.last_gate_debug = gate_debug
+        self._annotate(image, detections, gate_debug)
+
         with self.frame_lock:
-            self.frame = img
+            self.frame = image
 
-    def _body_to_world(self, z, x):
-        th = math.radians(self.heading)
-        north = z * math.cos(th) - x * math.sin(th)
-        east = z * math.sin(th) + x * math.cos(th)
-        return offset_latlon(self.lat, self.lon, north, east)
+    def _select_gate_candidate(self, detections):
+        red_detections = [
+            detection
+            for detection in detections
+            if detection["name"] in RED_CLASSES
+            and detection["conf"] >= CONF_MIN
+            and detection["z"] is not None
+            and detection["x"] is not None
+        ]
 
-    def _update_correction(self):
+        green_detections = [
+            detection
+            for detection in detections
+            if detection["name"] in GREEN_CLASSES
+            and detection["conf"] >= CONF_MIN
+            and detection["z"] is not None
+            and detection["x"] is not None
+        ]
+
+        if not red_detections or not green_detections:
+            return None
+
+        planned = self.waypoints[self.wp_index]
+        best_candidate = None
+        best_score = float("inf")
+
+        # Test every red/green combination from this one synchronized frame.
+        for red in red_detections:
+            for green in green_detections:
+                if red["u"] is None or green["u"] is None:
+                    continue
+
+                pixel_separation = abs(red["u"] - green["u"])
+                if pixel_separation < PAIR_MIN_PIXEL_SEP:
+                    continue
+
+                red_forward = red["z"]
+                red_right = red["x"]
+                green_forward = green["z"]
+                green_right = green["x"]
+
+                depth_difference = abs(red_forward - green_forward)
+                if depth_difference > PAIR_MAX_DEPTH_DIFF:
+                    continue
+
+                gate_forward = green_forward - red_forward
+                gate_right = green_right - red_right
+                gate_width = math.hypot(gate_forward, gate_right)
+
+                if not GATE_MIN_WIDTH <= gate_width <= GATE_MAX_WIDTH:
+                    continue
+
+                midpoint_forward = (red_forward + green_forward) / 2.0
+                midpoint_right = (red_right + green_right) / 2.0
+                # Empirical correction: computed target consistently lands on
+                # the left buoy, so shift toward whichever buoy is on the right.
+                if red_right >= green_right:
+                    toward_right_f = red_forward - green_forward
+                    toward_right_r = red_right - green_right
+                else:
+                    toward_right_f = green_forward - red_forward
+                    toward_right_r = green_right - red_right
+                midpoint_forward += MIDPOINT_SHIFT_RATIO * toward_right_f
+                midpoint_right += MIDPOINT_SHIFT_RATIO * toward_right_r
+
+                if midpoint_forward <= RANGE_MIN:
+                    continue
+
+                midpoint_world = self._body_to_world(
+                    midpoint_forward,
+                    midpoint_right,
+                )
+
+                correction_distance = dist_m(
+                    *midpoint_world,
+                    *planned,
+                )
+                if correction_distance > MAX_CORRECTION:
+                    continue
+
+                # The line between the buoys defines the gate. Use the
+                # perpendicular that points away from the current boat position
+                # to create a safe exit target beyond the gate.
+                normal_forward = -gate_right / gate_width
+                normal_right = gate_forward / gate_width
+
+                if (
+                    normal_forward * midpoint_forward
+                    + normal_right * midpoint_right
+                    < 0.0
+                ):
+                    normal_forward *= -1.0
+                    normal_right *= -1.0
+
+                exit_forward = (
+                    midpoint_forward
+                    + normal_forward * GATE_EXIT_DISTANCE
+                )
+                exit_right = (
+                    midpoint_right
+                    + normal_right * GATE_EXIT_DISTANCE
+                )
+
+                exit_world = self._body_to_world(
+                    exit_forward,
+                    exit_right,
+                )
+
+                # Prefer the pair whose midpoint is closest to the approximate
+                # QGC waypoint, then prefer buoys at similar depth.
+                score = correction_distance + 0.20 * depth_difference
+
+                if score < best_score:
+                    best_score = score
+                    best_candidate = {
+                        "red": red,
+                        "green": green,
+                        "width": gate_width,
+                        "mid_body": (midpoint_forward, midpoint_right),
+                        "mid_world": midpoint_world,
+                        "exit_body": (exit_forward, exit_right),
+                        "exit_world": exit_world,
+                        "planned_error": correction_distance,
+                    }
+
+        return best_candidate
+
+    def _record_gate_candidate(self, candidate):
         now = time.time()
-        if (self.last_red is None or self.last_green is None or
-                now - self.last_red[0] > PAIR_FRESH_S or
-                now - self.last_green[0] > PAIR_FRESH_S):
-            return
-        rlat, rlon = self.last_red[1]
-        glat, glon = self.last_green[1]
-        sep = dist_m(rlat, rlon, glat, glon)
-        if sep < GATE_MIN_WIDTH or sep > GATE_MAX_WIDTH:
-            return
-        cand = ((rlat + glat) / 2, (rlon + glon) / 2)
-        if dist_m(*cand, *self.waypoints[self.wp_index]) > MAX_CORRECTION:
-            return
-        if self.correction is None:
-            self.correction = cand
-        else:
-            self.correction = ((self.correction[0] + cand[0]) / 2,
-                               (self.correction[1] + cand[1]) / 2)
-        self.get_logger().info(
-            f"red@({rlat:.7f},{rlon:.7f}) green@({glat:.7f},{glon:.7f}) "
-            f"sep {sep:.1f}m mid->({cand[0]:.7f},{cand[1]:.7f})",
-            throttle_duration_sec=1.0)
 
+        if (
+            self.gate_samples
+            and now - self.last_pair_sample_time > PAIR_SAMPLE_TIMEOUT
+        ):
+            self.gate_samples.clear()
+
+        self.last_pair_sample_time = now
+
+        midpoint = candidate["mid_world"]
+        exit_point = candidate["exit_world"]
+
+        self.gate_samples.append(
+            (
+                midpoint[0],
+                midpoint[1],
+                exit_point[0],
+                exit_point[1],
+            )
+        )
+
+        midpoint_forward, midpoint_right = candidate["mid_body"]
+        self.get_logger().info(
+            "Gate pair: "
+            f"width={candidate['width']:.2f}m, "
+            f"mid=({midpoint_forward:.2f}m forward, "
+            f"{midpoint_right:+.2f}m right), "
+            f"samples={len(self.gate_samples)}/{PAIR_CONFIRM_FRAMES}",
+            throttle_duration_sec=0.5,
+        )
+
+        if len(self.gate_samples) < PAIR_CONFIRM_FRAMES:
+            return
+
+        midpoint_lat = median(sample[0] for sample in self.gate_samples)
+        midpoint_lon = median(sample[1] for sample in self.gate_samples)
+        exit_lat = median(sample[2] for sample in self.gate_samples)
+        exit_lon = median(sample[3] for sample in self.gate_samples)
+
+        midpoint_spread = max(
+            dist_m(midpoint_lat, midpoint_lon, sample[0], sample[1])
+            for sample in self.gate_samples
+        )
+        exit_spread = max(
+            dist_m(exit_lat, exit_lon, sample[2], sample[3])
+            for sample in self.gate_samples
+        )
+
+        if max(midpoint_spread, exit_spread) > PAIR_MAX_SPREAD:
+            self.get_logger().warning(
+                "Gate estimate is not stable yet: "
+                f"midpoint spread={midpoint_spread:.2f}m, "
+                f"exit spread={exit_spread:.2f}m"
+            )
+            return
+
+        self.gate_midpoint = (midpoint_lat, midpoint_lon)
+        self.gate_exit = (exit_lat, exit_lon)
+        self.gate_locked = True
+        self.gate_clearing = False
+
+        self.get_logger().info(
+            "Gate correction locked: "
+            f"midpoint=({midpoint_lat:.7f}, {midpoint_lon:.7f}), "
+            f"exit=({exit_lat:.7f}, {exit_lon:.7f})"
+        )
+
+    def _body_to_world(self, forward_m, right_m):
+        # Translate the camera measurement to the boat/GPS reference point.
+        forward_m += CAMERA_FORWARD_OFFSET_M
+        right_m += CAMERA_RIGHT_OFFSET_M
+
+        camera_heading = (
+            self.heading + CAMERA_YAW_OFFSET_DEG
+        ) % 360.0
+        heading_rad = math.radians(camera_heading)
+
+        north_m = (
+            forward_m * math.cos(heading_rad)
+            - right_m * math.sin(heading_rad)
+        )
+        east_m = (
+            forward_m * math.sin(heading_rad)
+            + right_m * math.cos(heading_rad)
+        )
+
+        return offset_latlon(
+            self.lat,
+            self.lon,
+            north_m,
+            east_m,
+        )
+
+    # ---------------- MAVLink output ----------------
     def _send_target(self, lat, lon):
-        self.mav.mav.set_position_target_global_int_send(
-            0, self.mav.target_system, self.mav.target_component,
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-            0b110111111000,
-            int(lat * 1e7), int(lon * 1e7), 0,
-            0, 0, 0, 0, 0, 0, 0, 0)
-        tag = "corrected" if self.correction else "planned"
-        self.get_logger().info(
-            f"WP {self.wp_index + 1}/{len(self.waypoints)} ({tag}) "
-            f"dist {dist_m(self.lat, self.lon, lat, lon):.1f}m")
+        time_boot_ms = int(time.monotonic() * 1000.0) & 0xFFFFFFFF
 
-    # ---------- debug stream ----------
-    def _annotate(self, img, dets):
-        for det in dets:
-            x1, y1, x2, y2 = det["box"]
-            name = det["name"]
-            color = ((0, 255, 0) if name in GREEN_CLASSES else
-                     (0, 0, 255) if name in RED_CLASSES else (0, 255, 255))
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-            label = f"{name} {int(det['conf']*100)}%"
-            if det["z"] is not None and det["x"] is not None:
-                label += f" | {det['z']:.1f}m {det['x']:+.1f}m"
-            cv2.putText(img, label, (x1, max(y1 - 6, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        self.mav.mav.set_position_target_global_int_send(
+            time_boot_ms,
+            self.mav.target_system,
+            self.mav.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            POSITION_ONLY_TYPE_MASK,
+            int(lat * 1e7),
+            int(lon * 1e7),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+        if self.wp_index in GATE_WP_INDICES and self.gate_locked:
+            tag = "gate-exit" if self.gate_clearing else "gate-midpoint"
+        else:
+            tag = "planned"
+
+        self.get_logger().info(
+            f"WP {self.wp_index + 1}/{len(self.waypoints)} "
+            f"({tag}) dist={dist_m(self.lat, self.lon, lat, lon):.1f}m"
+        )
+
+    # ---------------- Debug video stream ----------------
+    def _annotate(self, image, detections, gate_candidate):
+        for detection in detections:
+            x1, y1, x2, y2 = detection["box"]
+            name = detection["name"]
+
+            if name in GREEN_CLASSES:
+                color = (0, 255, 0)
+            elif name in RED_CLASSES:
+                color = (0, 0, 255)
+            else:
+                color = (0, 255, 255)
+
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+
+            label = f"{name} {int(detection['conf'] * 100)}%"
+            if detection["z"] is not None and detection["x"] is not None:
+                label += (
+                    f" | {detection['z']:.1f}m "
+                    f"{detection['x']:+.1f}m"
+                )
+
+            cv2.putText(
+                image,
+                label,
+                (x1, max(y1 - 6, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+            )
+
+        if gate_candidate is not None:
+            red = gate_candidate["red"]
+            green = gate_candidate["green"]
+
+            red_point = (red["u"], red["v"])
+            green_point = (green["u"], green["v"])
+            midpoint_point = (
+                int((red["u"] + green["u"]) / 2),
+                int((red["v"] + green["v"]) / 2),
+            )
+
+            cv2.line(image, red_point, green_point, (255, 255, 255), 2)
+            cv2.circle(image, midpoint_point, 6, (255, 255, 255), -1)
+            cv2.putText(
+                image,
+                f"gate {gate_candidate['width']:.2f}m",
+                (midpoint_point[0] + 8, midpoint_point[1]),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+            )
+
         now = time.time()
-        self.fps = 0.9 * self.fps + 0.1 * (1.0 / max(now - self._t_prev, 1e-3))
+        instantaneous_fps = 1.0 / max(now - self._t_prev, 1e-3)
+        self.fps = 0.9 * self.fps + 0.1 * instantaneous_fps
         self._t_prev = now
-        status = (f"{self.fps:.0f}fps  "
-                  f"WP {min(self.wp_index + 1, len(self.waypoints))}"
-                  f"/{len(self.waypoints)} "
-                  f"{'CORRECTED' if self.correction else 'planned'} "
-                  f"mode {self.mode}")
-        cv2.putText(img, status, (6, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+        if self.gate_clearing:
+            phase = "GATE EXIT"
+        elif self.gate_locked:
+            phase = "GATE MIDPOINT"
+        elif self.wp_index in GATE_WP_INDICES:
+            phase = f"GATE SEARCH {len(self.gate_samples)}/{PAIR_CONFIRM_FRAMES}"
+        else:
+            phase = "PLANNED"
+
+        waypoint_number = min(self.wp_index + 1, len(self.waypoints))
+        status = (
+            f"{self.fps:.0f}fps  "
+            f"WP {waypoint_number}/{len(self.waypoints)}  "
+            f"{phase}  mode {self.mode}"
+        )
+
+        cv2.putText(
+            image,
+            status,
+            (6, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+        )
 
     def _start_stream(self):
         node = self
 
-        class H(BaseHTTPRequestHandler):
+        class StreamHandler(BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
-                self.send_header("Content-Type",
-                                 "multipart/x-mixed-replace; boundary=frame")
+                self.send_header(
+                    "Content-Type",
+                    "multipart/x-mixed-replace; boundary=frame",
+                )
                 self.end_headers()
+
                 try:
                     while True:
                         with node.frame_lock:
-                            fr = None if node.frame is None else node.frame.copy()
-                        if fr is None:
+                            frame = (
+                                None
+                                if node.frame is None
+                                else node.frame.copy()
+                            )
+
+                        if frame is None:
                             time.sleep(0.1)
                             continue
-                        ok, jpg = cv2.imencode(".jpg", fr,
-                                               [cv2.IMWRITE_JPEG_QUALITY, 60])
+
+                        ok, jpeg = cv2.imencode(
+                            ".jpg",
+                            frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, 60],
+                        )
+
                         if ok:
-                            self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
-                            self.wfile.write(jpg.tobytes())
+                            self.wfile.write(
+                                b"--frame\r\n"
+                                b"Content-Type: image/jpeg\r\n\r\n"
+                            )
+                            self.wfile.write(jpeg.tobytes())
                             self.wfile.write(b"\r\n")
+
                         time.sleep(0.05)
+
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-            def log_message(self, *a):
+            def log_message(self, *args):
                 pass
 
-        srv = HTTPServer(("0.0.0.0", 8080), H)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        server = HTTPServer(("0.0.0.0", 8080), StreamHandler)
+        threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        ).start()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = GateNavigator()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.try_shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

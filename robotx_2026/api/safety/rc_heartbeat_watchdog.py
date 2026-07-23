@@ -49,7 +49,7 @@ class RCHeartbeatWatchdog(Node):
         self.declare_parameter("use_rc_health_bit", True)
         self.declare_parameter("require_armed", True)
         self.declare_parameter("link_timeout", 3.0)    # Pixhawk MAVLink silence
-        self.declare_parameter("enable_latch", True)
+        self.declare_parameter("enable_latch", False)  # enable True if needed for safety, otherwise False for convenience
         self.declare_parameter("reset_channel", 7)     # switch that clears latch
         self.declare_parameter("reset_low_pwm", 1300)  # switch "low" below this
         self.declare_parameter("reset_high_pwm", 1700)  # switch "high" above this

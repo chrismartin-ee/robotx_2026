@@ -2,7 +2,6 @@ import time
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool
-from std_srvs.srv import Trigger
 from pymavlink import mavutil
 
 
@@ -24,8 +23,13 @@ class RCHeartbeatWatchdog(Node):
 
     If nothing confirms the link for `heartbeat_timeout` seconds while the
     vehicle is ARMED, the watchdog force-disarms (motors off, same as the kill
-    button) and LATCHES: it keeps the vehicle disarmed until an operator calls
-    the `~/reset` service AND the RC link has recovered.
+    button). When `enable_latch` is True (default) it also LATCHES: the vehicle
+    is held disarmed until the operator clears the latch from the transmitter
+    itself -- a deliberate LOW->HIGH toggle of `reset_channel` (e.g. cycling the
+    arm/e-stop switch off and back on). The toggle only counts once a genuine
+    LOW is seen with the RC link alive, so simply reconnecting with the switch
+    already HIGH does not clear the latch. With `enable_latch` False the boat is
+    disarmed while the link is down and recovers on its own when it returns.
 
     This complements, and does not replace, ArduPilot's own FS_THR / FS_GCS
     failsafes -- run both for defense in depth.
@@ -45,6 +49,10 @@ class RCHeartbeatWatchdog(Node):
         self.declare_parameter("use_rc_health_bit", True)
         self.declare_parameter("require_armed", True)
         self.declare_parameter("link_timeout", 3.0)    # Pixhawk MAVLink silence
+        self.declare_parameter("enable_latch", True)
+        self.declare_parameter("reset_channel", 7)     # switch that clears latch
+        self.declare_parameter("reset_low_pwm", 1300)  # switch "low" below this
+        self.declare_parameter("reset_high_pwm", 1700)  # switch "high" above this
 
         endpoint = self.get_parameter("endpoint").value
         self.heartbeat_timeout = float(self.get_parameter("heartbeat_timeout").value)
@@ -53,9 +61,12 @@ class RCHeartbeatWatchdog(Node):
         self.use_rc_health_bit = bool(self.get_parameter("use_rc_health_bit").value)
         self.require_armed = bool(self.get_parameter("require_armed").value)
         self.link_timeout = float(self.get_parameter("link_timeout").value)
+        self.enable_latch = bool(self.get_parameter("enable_latch").value)
+        self.reset_channel = int(self.get_parameter("reset_channel").value)
+        self.reset_low = int(self.get_parameter("reset_low_pwm").value)
+        self.reset_high = int(self.get_parameter("reset_high_pwm").value)
 
         self.kill_pub = self.create_publisher(Bool, "/kill_active", 10)
-        self.reset_srv = self.create_service(Trigger, "~/reset", self._reset_cb)
 
         self.get_logger().info(f"Connecting to Pixhawk on {endpoint}")
         self.master = mavutil.mavlink_connection(endpoint)
@@ -76,6 +87,8 @@ class RCHeartbeatWatchdog(Node):
         now = time.monotonic()
         self.armed = False
         self.killed = False
+        self.reset_armed = False       # saw a valid LOW since the latch engaged
+        self.reset_pwm = 0             # latest reset-channel raw PWM
         self.last_rc_ok = now          # last valid monitored-channel PWM
         self.last_sys_status = 0.0
         self.rc_health_bad = False     # receiver present but unhealthy
@@ -106,6 +119,7 @@ class RCHeartbeatWatchdog(Node):
                 pwm = getattr(msg, f"chan{self.rc_channel}_raw", 0)
                 if pwm >= self.min_valid_pwm:
                     self.last_rc_ok = now
+                self.reset_pwm = getattr(msg, f"chan{self.reset_channel}_raw", 0)
             elif mtype == "SYS_STATUS":
                 self.last_sys_status = now
                 bit = mavutil.mavlink.MAV_SYS_STATUS_SENSOR_RC_RECEIVER
@@ -123,6 +137,26 @@ class RCHeartbeatWatchdog(Node):
         )
         return rc_timed_out or health_bad
 
+    def _poll_latch_reset(self):
+        """Clear the latch on a deliberate LOW->HIGH toggle of the reset channel.
+
+        A valid LOW must be seen first (`reset_armed`) before a HIGH clears the
+        latch, so reconnecting with the switch already HIGH -- or the 0 PWM that
+        appears during link loss -- can never auto-clear the kill.
+        """
+        pwm = self.reset_pwm
+        if pwm < self.min_valid_pwm:
+            return  # no valid RC signal on this channel; not a real toggle
+        if pwm <= self.reset_low:
+            self.reset_armed = True
+        elif pwm >= self.reset_high and self.reset_armed:
+            self.reset_armed = False
+            self.killed = False
+            self._publish_kill(False)
+            self.get_logger().info(
+                "Kill latch cleared by RC reset toggle on channel "
+                f"{self.reset_channel}. Re-arm from the transmitter/GCS.")
+
     # ---------------- Watchdog loop ----------------
     def tick(self):
         self._drain()
@@ -132,12 +166,16 @@ class RCHeartbeatWatchdog(Node):
         link_lost = self._link_lost(now)
 
         if self.killed:
-            # Latched: keep enforcing the kill for as long as it is engaged.
-            if self.armed and mavlink_ok:
-                self._disarm("re-enforcing latched kill")
-            self._publish_kill(True)
-            self._status_log(now, link_lost, mavlink_ok)
-            return
+            # Latched: look for the operator's RC reset toggle, otherwise keep
+            # enforcing the kill.
+            self._poll_latch_reset()
+            if self.killed:
+                if self.armed and mavlink_ok:
+                    self._disarm("re-enforcing latched kill")
+                self._publish_kill(True)
+                self._status_log(now, link_lost, mavlink_ok)
+                return
+            # Latch just cleared; fall through and evaluate normally.
 
         if not link_lost:
             self._publish_kill(False)
@@ -161,11 +199,20 @@ class RCHeartbeatWatchdog(Node):
                 throttle_duration_sec=2.0)
             return
 
-        # Trigger the latched kill.
-        self.killed = True
-        self.get_logger().error(
-            f"RC heartbeat lost for >{self.heartbeat_timeout:.1f}s "
-            "-> FORCE-DISARMING (latched). Call ~/reset to recover.")
+        if self.enable_latch:
+            if not self.killed:
+                self.reset_armed = False  # require a fresh LOW->HIGH after kill
+                self.get_logger().error(
+                    f"RC heartbeat lost for >{self.heartbeat_timeout:.1f}s "
+                    "-> FORCE-DISARMING (latched). Toggle RC channel "
+                    f"{self.reset_channel} low->high to clear.")
+            self.killed = True
+        else:
+            self.get_logger().error(
+                "RC heartbeat lost -> FORCE-DISARMING "
+                "(auto-recovers when the link returns)",
+                throttle_duration_sec=1.0)
+
         self._disarm("RC heartbeat lost")
         self._publish_kill(True)
 
@@ -197,21 +244,6 @@ class RCHeartbeatWatchdog(Node):
             f"armed={self.armed} rc_lost={link_lost} killed={self.killed} "
             f"mavlink_ok={mavlink_ok} rc_age={now - self.last_rc_ok:.1f}s",
             throttle_duration_sec=5.0)
-
-    # ---------------- Reset service ----------------
-    def _reset_cb(self, request, response):
-        if self._link_lost(time.monotonic()):
-            response.success = False
-            response.message = (
-                "Refused: RC link still down. Restore the transmitter first.")
-            self.get_logger().warn("Kill reset refused - RC link still down")
-            return response
-        self.killed = False
-        self._publish_kill(False)
-        response.success = True
-        response.message = "Kill latch reset. Re-arm from the transmitter/GCS."
-        self.get_logger().info("Kill latch reset by operator")
-        return response
 
 
 def main(args=None):

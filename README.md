@@ -18,8 +18,10 @@ Safety: core.launch.py also starts `rc_watchdog`. If the RC transmitter goes
 out of range or loses power (RC link heartbeat stops) while ARMED, it
 force-disarms the boat and latches — no need to press the kill switch. It
 complements ArduPilot's own FS_THR/FS_GCS failsafes; set those too.
-Recover with: `ros2 service call /rc_heartbeat_watchdog/reset std_srvs/srv/Trigger`
-(only succeeds once the transmitter link is back), then re-arm.
+Recover from the transmitter itself: once the link is back, cycle the reset
+switch (default RC7, `reset_channel` param) LOW then HIGH — a fresh low→high
+toggle clears the latch, then re-arm. Reconnecting with the switch already high
+will not clear it. Set `enable_latch:=false` to disarm-only with auto-recovery.
 
 ```
 robotx_2026/

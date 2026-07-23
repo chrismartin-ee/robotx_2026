@@ -14,4 +14,9 @@ def generate_launch_description():
             executable='pixhawk_led_node',
             output='screen',
         ),
+        Node(
+            package='robotx_2026',
+            executable='rc_watchdog',
+            output='screen',
+        ),
     ])

@@ -7,4 +7,7 @@ mavproxy.py \
   --master=/dev/serial/by-id/usb-ArduPilot_Pixhawk1_3A001F001051333531353431-if00 \
   --out=udp:127.0.0.1:14550 \
   --out=udp:127.0.0.1:14551 \
+  --out=udp:127.0.0.1:14552 \
   --out=udp:${LAPTOP_IP}:14550
+# Ports: 14550 pixhawk_led_node, 14551 navigation nodes,
+#        14552 rc_watchdog (RC-loss failsafe), LAPTOP:14550 GCS.

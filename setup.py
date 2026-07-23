@@ -25,6 +25,7 @@ setup(
             'pixhawk_led_node = robotx_2026.api.pixhawk.pixhawk_led_status_node:main',
             'gate_navigator = robotx_2026.api.navigation.gate_navigator:main',
             'dp_hold = robotx_2026.api.navigation.dp_hold:main',
+            'rc_watchdog = robotx_2026.api.safety.rc_heartbeat_watchdog:main',
         ],
     },
 )

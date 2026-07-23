@@ -14,11 +14,18 @@ Code lives on the HOST at ~/robotx_ws, bind-mounted into the container at /root/
 2. ros2 launch robotx_2026 core.launch.py
 LED: red = disarmed/e-stop, yellow = armed manual, green = auto.
 
+Safety: core.launch.py also starts `rc_watchdog`. If the RC transmitter goes
+out of range or loses power (RC link heartbeat stops) while ARMED, it
+force-disarms the boat and latches — no need to press the kill switch. It
+complements ArduPilot's own FS_THR/FS_GCS failsafes; set those too.
+Recover with: `ros2 service call /rc_heartbeat_watchdog/reset std_srvs/srv/Trigger`
+(only succeeds once the transmitter link is back), then re-arm.
+
 ```
 robotx_2026/
 ├── package.xml                <- ROS 2 package manifest
 ├── setup.py                   <- defines the nodes: led_node, pixhawk_led_node,
-│                                 gate_navigator
+│                                 gate_navigator, dp_hold, rc_watchdog
 ├── setup.cfg
 ├── .gitignore
 ├── README.md
@@ -46,6 +53,11 @@ robotx_2026/
         ├── pixhawk/
         │   └── pixhawk_led_status_node.py <- Pixhawk state -> /led_state
         │                                     (1=red 2=yellow 3=green)
+        ├── safety/
+        │   └── rc_heartbeat_watchdog.py   <- force-disarms + latches if the RC
+        │                                     link heartbeat is lost (out of
+        │                                     range / power loss). Node name
+        │                                     rc_watchdog, MAVLink on :14552
         └── navigation/
             └── dp_hold.py		<- holds position in relation to target (buoy for now, hard 
                                            coded yaw and distance from target, keeping target centered 

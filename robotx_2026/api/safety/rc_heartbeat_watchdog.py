@@ -70,18 +70,13 @@ class RCHeartbeatWatchdog(Node):
 
         self.get_logger().info(f"Connecting to Pixhawk on {endpoint}")
         self.master = mavutil.mavlink_connection(endpoint)
-        self.master.wait_heartbeat()
-        self.get_logger().info("Pixhawk heartbeat received; RC watchdog active")
-
-        # Make sure the streams we depend on are actually flowing.
-        for msg_id, rate_hz in (
-            (mavutil.mavlink.MAVLINK_MSG_ID_RC_CHANNELS, 5),
-            (mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 4),
-        ):
-            self.master.mav.command_long_send(
-                self.master.target_system, self.master.target_component,
-                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
-                msg_id, int(1e6 / rate_hz), 0, 0, 0, 0, 0)
+        # Do NOT block on wait_heartbeat(): a missing or late Pixhawk would
+        # freeze node init (and any launch file waiting on it). Instead we lock
+        # onto the autopilot the first time _drain() hears its HEARTBEAT, then
+        # request our streams once. Until then the tick loop is a safe no-op.
+        self.streams_requested = False
+        self.get_logger().info(
+            "RC watchdog started; waiting for Pixhawk heartbeat (non-blocking)")
 
         # State
         now = time.monotonic()
@@ -100,6 +95,26 @@ class RCHeartbeatWatchdog(Node):
         self.timer = self.create_timer(0.1, self.tick)
 
     # ---------------- MAVLink intake ----------------
+    def _request_streams(self, now):
+        """Ask the Pixhawk for the streams we depend on, once the link is up.
+
+        Called the first time we hear the autopilot's HEARTBEAT (replacing the
+        old blocking wait_heartbeat). We also reset the RC/SYS timers to `now`
+        so a late connection cannot register as an instant stale-link kill
+        before the freshly requested streams have had a chance to arrive."""
+        for msg_id, rate_hz in (
+            (mavutil.mavlink.MAVLINK_MSG_ID_RC_CHANNELS, 25),
+            (mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 5),
+        ):
+            self.master.mav.command_long_send(
+                self.master.target_system, self.master.target_component,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                msg_id, int(1e6 / rate_hz), 0, 0, 0, 0, 0)
+        self.last_rc_ok = now
+        self.last_sys_status = now
+        self.streams_requested = True
+        self.get_logger().info("Pixhawk heartbeat received; RC watchdog active")
+
     def _drain(self):
         now = time.monotonic()
         while True:
@@ -107,6 +122,18 @@ class RCHeartbeatWatchdog(Node):
                 type=["HEARTBEAT", "RC_CHANNELS", "SYS_STATUS"], blocking=False)
             if msg is None:
                 break
+
+            if not self.streams_requested:
+                # Lock onto the first autopilot HEARTBEAT, then request streams.
+                if (msg.get_type() == "HEARTBEAT"
+                        and msg.get_srcComponent()
+                        == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1):
+                    self.master.target_system = msg.get_srcSystem()
+                    self.master.target_component = msg.get_srcComponent()
+                    self._request_streams(now)
+                else:
+                    continue  # ignore GCS/other components until locked
+
             if msg.get_srcSystem() != self.master.target_system:
                 continue
 

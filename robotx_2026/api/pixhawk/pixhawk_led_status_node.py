@@ -28,17 +28,25 @@ class PixhawkLEDStatusNode(Node):
 
         self.get_logger().info(f"Connecting to Pixhawk on {endpoint}")
         self.master = mavutil.mavlink_connection(endpoint)
-        self.master.wait_heartbeat()
-        self.get_logger().info("Pixhawk heartbeat received")
+        # Non-blocking startup: don't wait_heartbeat() (it would freeze init if
+        # the Pixhawk is late). Lock on in check_pixhawk_state and request the
+        # RC stream then.
+        self.streams_requested = False
+        self.get_logger().info(
+            "LED status started; waiting for Pixhawk heartbeat (non-blocking)")
 
+        # 25 Hz RC + a 50 ms timer keep e-stop -> RED reporting under ~90 ms.
+        self.timer = self.create_timer(0.05, self.check_pixhawk_state)
+
+    def _request_streams(self):
         self.master.mav.command_long_send(
             self.master.target_system, self.master.target_component,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
             mavutil.mavlink.MAVLINK_MSG_ID_RC_CHANNELS,
-            200000,  # microseconds -> 5 Hz
+            40000,  # microseconds -> 25 Hz
             0, 0, 0, 0, 0)
-
-        self.timer = self.create_timer(0.2, self.check_pixhawk_state)
+        self.streams_requested = True
+        self.get_logger().info("Pixhawk heartbeat received")
 
     def _auto_cb(self, msg):
         if msg.data:
@@ -60,6 +68,16 @@ class PixhawkLEDStatusNode(Node):
                 type=["HEARTBEAT", "RC_CHANNELS"], blocking=False)
             if msg is None:
                 break
+            if not self.streams_requested:
+                # Lock onto the first autopilot HEARTBEAT, then request streams.
+                if (msg.get_type() == "HEARTBEAT"
+                        and msg.get_srcComponent()
+                        == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1):
+                    self.master.target_system = msg.get_srcSystem()
+                    self.master.target_component = msg.get_srcComponent()
+                    self._request_streams()
+                else:
+                    continue  # ignore GCS/other components until locked
             if msg.get_srcSystem() != self.master.target_system:
                 continue
             if msg.get_type() == "HEARTBEAT":
